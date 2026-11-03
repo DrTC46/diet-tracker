@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Seed test data</title></head>
+<body>
+<p id="status">Seeding...</p>
+<script type="module">
+// Replaces local data with a 60-day demo set, then opens the app. Usage: seed.html?go=stats
+// Only runs on a local server, so the deployed copy can never overwrite real data.
+import { addDays, dateRange, isWeekend, todayISO } from '../js/calc.js';
+import * as db from '../js/db.js';
+
+const status = document.getElementById('status');
+if (!['localhost', '127.0.0.1'].includes(location.hostname)) {
+  status.textContent = 'Seeding is only available on a local server.';
+} else {
+  let state = 42; // deterministic, so runs are comparable
+  const rand = () => (state = (state * 1664525 + 1013904223) % 4294967296) / 4294967296;
+  const near = (value, spread) => Math.round(value + (rand() - 0.5) * 2 * spread);
+
+  const today = todayISO();
+  const days = [], entries = [];
+  let weight = 84;
+  dateRange(addDays(today, -59), today).forEach((date, i) => {
+    const isToday = date === today;
+    const missing = i % 11 === 5; // an unlogged day now and then
+    const weekend = isWeekend(date);
+    const burned = near(weekend ? 2350 : 2600, 180);
+    const food = [
+      ['breakfast', 'Skyr and oats', near(380, 40), near(28, 4)],
+      ['lunch', weekend ? 'Burger and fries' : 'Chicken salad', near(weekend ? 1050 : 620, 80), near(weekend ? 32 : 45, 6)],
+      ['dinner', 'Pasta bolognese', near(weekend ? 950 : 720, 90), near(34, 6)],
+      ['snack', 'Cookies', near(weekend ? 420 : 180, 40), near(3, 1)],
+    ];
+    const eaten = food.reduce((sum, f) => sum + f[2], 0);
+    if (!missing) {
+      if (!isToday) days.push({ date, burnedKcal: burned, weightKg: i % 2 ? null : Math.round((weight + (rand() - 0.5)) * 10) / 10 });
+      food.forEach(([meal, name, kcal, proteinG], n) => entries.push({ id: `seed-${date}-${n}`, date, meal, name, kcal, proteinG }));
+      // Real weight falls more slowly than the logged calories predict.
+      weight += (eaten - burned + 150) / 7700;
+    }
+  });
+  await db.importAll({
+    app: 'diet-tracker-backup', version: 1, days, entries,
+    foods: [
+      { id: 'seed-food-1', name: 'Skyr nature', basis: '100g', kcal: 57, proteinG: 10, useCount: 12 },
+      { id: 'seed-food-2', name: 'Chicken salad', basis: 'serving', kcal: 620, proteinG: 45, useCount: 6 },
+    ],
+    mealTemplates: [{ id: 'seed-template-1', name: 'Usual breakfast', items: [{ name: 'Skyr and oats', kcal: 380, proteinG: 28 }] }],
+    settings: { targetBalanceKcal: -500, goalWeightKg: 76, proteinTargetG: 150, firstUseAt: new Date().toISOString(), lastBackupAt: new Date().toISOString() },
+  });
+  status.textContent = 'Seeded.';
+  const go = new URLSearchParams(location.search).get('go');
+  if (go) location.replace(`../index.html#/${go}`);
+}
+</script>
+</body>
+</html>

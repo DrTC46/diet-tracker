@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Diet tracker tests</title>
+<style>
+  body { font: 14px system-ui, sans-serif; margin: 16px; }
+  .fail { color: #d03b3b; font-weight: 600; }
+  .pass { color: #52514e; }
+  #summary { font-size: 18px; font-weight: 600; margin-bottom: 12px; }
+</style>
+</head>
+<body>
+<div id="summary">Running...</div>
+<div id="results"></div>
+<script type="module">
+import * as c from '../js/calc.js';
+import { buildSuggestions } from '../js/rules.js';
+import { parseProduct } from '../js/off.js';
+import { validateBackup } from '../js/db.js';
+
+const results = [];
+const test = (name, fn) => {
+  try { fn(); results.push({ name, ok: true }); }
+  catch (e) { results.push({ name, ok: false, message: e.message }); }
+};
+const eq = (actual, expected, label = '') => {
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+    throw new Error(`${label} expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
+  }
+};
+const near = (actual, expected, tolerance = 0.001, label = '') => {
+  if (actual === null || Math.abs(actual - expected) > tolerance) throw new Error(`${label} expected ~${expected}, got ${actual}`);
+};
+
+const entry = (date, kcal, proteinG = 30, meal = 'lunch', name = 'Food') => ({ id: `${date}-${meal}-${name}-${kcal}`, date, kcal, proteinG, meal, name });
+
+// Builds `count` days ending at `end`. `make(date, i)` returns { consumed, burned, protein, weightKg, meal, name }.
+function fixture(end, count, make) {
+  const start = c.addDays(end, -(count - 1));
+  const records = [], entries = [];
+  c.dateRange(start, end).forEach((date, i) => {
+    const d = make(date, i) ?? {};
+    records.push({ date, burnedKcal: d.burned ?? null, weightKg: d.weightKg ?? null });
+    if (d.consumed !== undefined) {
+      const protein = d.protein === undefined ? 150 : d.protein;
+      entries.push(entry(date, d.consumed, protein, d.meal ?? 'lunch', d.name ?? `Food ${i}`));
+    }
+  });
+  return { days: c.buildDays(start, end, records, entries), entries };
+}
+const END = '2026-11-01'; // a Sunday
+const rule = (id, input) => buildSuggestions({ today: c.addDays(END, 1), settings: {}, ...input }).find((s) => s.id === id);
+
+// --- Dates ---
+test('addDays crosses months and DST', () => {
+  eq(c.addDays('2026-10-31', 1), '2026-11-01');
+  eq(c.addDays('2026-03-28', 2), '2026-03-30');
+  eq(c.addDays('2026-10-24', 7), '2026-10-31');
+});
+test('weeks start on Monday', () => {
+  eq(c.startOfWeek('2026-11-01'), '2026-10-26');
+  eq(c.startOfWeek('2026-11-02'), '2026-11-02');
+  eq(c.endOfWeek('2026-11-02'), '2026-11-08');
+});
+test('month bounds handle February', () => {
+  eq(c.startOfMonth('2028-02-15'), '2028-02-01');
+  eq(c.endOfMonth('2028-02-15'), '2028-02-29');
+  eq(c.endOfMonth('2026-12-31'), '2026-12-31');
+});
+test('previous range has the same length', () => {
+  eq(c.previousRange('2026-11-02', '2026-11-08'), { start: '2026-10-26', end: '2026-11-01' });
+});
+
+// --- Balance ---
+test('a day counts only with burned and food', () => {
+  eq(c.summarizeDay('2026-11-01', { burnedKcal: 2000 }, []).counted, false);
+  eq(c.summarizeDay('2026-11-01', null, [entry('2026-11-01', 500)]).counted, false);
+  const day = c.summarizeDay('2026-11-01', { burnedKcal: 2500 }, [entry('2026-11-01', 2000)]);
+  eq(day.counted, true);
+  eq(day.balance, -500);
+});
+test('burned of zero still counts as entered', () => {
+  eq(c.summarizeDay('2026-11-01', { burnedKcal: 0 }, [entry('2026-11-01', 100)]).counted, true);
+});
+test('period sums use counted days only, never zero-filling', () => {
+  // 3 days: -500, missing, +200
+  const { days } = fixture('2026-11-03', 3, (_, i) => [
+    { consumed: 2000, burned: 2500 }, { burned: 2500 }, { consumed: 2200, burned: 2000 },
+  ][i]);
+  const p = c.summarizePeriod(days);
+  eq(p.totalDays, 3);
+  eq(p.loggedDays, 2);
+  eq(p.balance, -300);
+  eq(p.consumed, 4200);
+  eq(p.avgBalance, -150);
+  near(p.estimatedKg, -300 / 7700);
+  near(p.projectedKg, (-150 * 3) / 7700);
+});
+test('7700 kcal is one kilogram', () => {
+  const { days } = fixture(END, 7, () => ({ consumed: 1400, burned: 2500 }));
+  near(c.summarizePeriod(days).estimatedKg, -1);
+});
+test('empty period is safe', () => {
+  const p = c.summarizePeriod([]);
+  eq(p.loggedDays, 0); eq(p.avgBalance, null); eq(p.estimatedKg, 0); eq(p.projectedKg, null);
+});
+test('average protein skips days with incomplete protein', () => {
+  const { days } = fixture('2026-11-02', 2, (_, i) => [
+    { consumed: 2000, burned: 2500, protein: 100 }, { consumed: 2000, burned: 2500, protein: null },
+  ][i]);
+  eq(c.summarizePeriod(days).avgProtein, 100);
+});
+
+// --- Weight ---
+test('trend is a 7-day trailing mean', () => {
+  const { days } = fixture('2026-11-08', 8, (_, i) => ({ weightKg: 80 + i }));
+  const trend = c.weightTrend(days);
+  eq(trend[0].trendKg, 80);
+  eq(trend[2].trendKg, 81);
+  eq(trend[7].trendKg, 84); // mean of 81..87
+});
+test('estimated weight starts at first weigh-in and skips uncounted days', () => {
+  const { days } = fixture('2026-11-04', 4, (_, i) => [
+    { consumed: 1000, burned: 8700 }, { weightKg: 80 }, { burned: 2000 }, { consumed: 1000, burned: 8700 },
+  ][i]);
+  const est = c.estimatedWeight(days);
+  eq(est.length, 3);
+  eq(est[0].estimatedKg, 80);
+  eq(est[1].estimatedKg, 80);
+  near(est[2].estimatedKg, 79);
+});
+test('calibration needs enough data', () => {
+  const few = fixture(END, 13, (_, i) => ({ consumed: 2000, burned: 2500, weightKg: 80 }));
+  eq(c.calibrate(few.days), null);
+  const noWeighIns = fixture(END, 28, () => ({ consumed: 2000, burned: 2500 }));
+  eq(c.calibrate(noWeighIns.days), null);
+  const threeWeighIns = fixture(END, 28, (_, i) => ({ consumed: 2000, burned: 2500, weightKg: i % 10 === 0 ? 80 : null }));
+  eq(c.calibrate(threeWeighIns.days), null);
+});
+test('calibration is near zero when the scale matches the calories', () => {
+  const { days } = fixture(END, 28, (_, i) => ({ consumed: 2000, burned: 2500, weightKg: 80 - (i * 500) / 7700 }));
+  near(c.calibrate(days).errorKcalPerDay, 0, 1);
+});
+test('calibration shows the full gap when weight stays flat on a logged deficit', () => {
+  const { days } = fixture(END, 28, () => ({ consumed: 2000, burned: 2500, weightKg: 80 }));
+  const result = c.calibrate(days);
+  near(result.errorKcalPerDay, 500, 1);
+  near(result.measuredKg, 0);
+});
+
+// --- Breakdown ---
+test('meal breakdown ignores uncounted days', () => {
+  const { days } = fixture('2026-11-02', 2, (_, i) => [{ burned: 2000 }, {}][i]);
+  const entries = [entry('2026-11-01', 300, 10, 'breakfast'), entry('2026-11-01', 100, 10, 'dinner'), entry('2026-11-02', 900, 10, 'lunch')];
+  const real = c.buildDays('2026-11-01', '2026-11-02', [{ date: '2026-11-01', burnedKcal: 2000 }], entries);
+  const meals = c.mealBreakdown(real, entries);
+  eq(meals.find((m) => m.meal === 'breakfast').share, 0.75);
+  eq(meals.find((m) => m.meal === 'lunch').kcal, 0);
+  eq(days.length, 2);
+});
+test('top foods merge names case-insensitively', () => {
+  const entries = [entry('2026-11-01', 300, 10, 'lunch', 'Rice'), entry('2026-11-01', 100, 5, 'dinner', ' rice '), entry('2026-11-01', 200, 20, 'dinner', 'Egg')];
+  const days = c.buildDays('2026-11-01', '2026-11-01', [{ date: '2026-11-01', burnedKcal: 2000 }], entries);
+  const top = c.topFoods(days, entries);
+  eq(top[0].kcal, 400); eq(top[0].count, 2); eq(top[0].share, 400 / 600); eq(top[1].name, 'Egg');
+});
+test('quick entries count towards the total but are not listed as a food', () => {
+  const entries = [entry('2026-11-01', 300, 10, 'lunch', c.QUICK_ENTRY_NAME), entry('2026-11-01', 100, 5, 'dinner', 'Egg')];
+  const days = c.buildDays('2026-11-01', '2026-11-01', [{ date: '2026-11-01', burnedKcal: 2000 }], entries);
+  const top = c.topFoods(days, entries);
+  eq(top.length, 1); eq(top[0].name, 'Egg'); eq(top[0].share, 0.25);
+});
+test('best days have the lowest balance', () => {
+  const { days } = fixture('2026-11-03', 3, (_, i) => ({ consumed: [2000, 3000, 1500][i], burned: 2500 }));
+  const { best, worst } = c.bestWorstDays(days, 1);
+  eq(best[0].balance, -1000); eq(worst[0].balance, 500);
+});
+test('CSV quotes text and neutralises formulas', () => {
+  const csv = c.entriesToCsv([entry('2026-11-01', 100, null, 'lunch', '=cmd, "x"')]);
+  eq(csv.split('\n')[1], `2026-11-01,lunch,"'=cmd, ""x""",100,`);
+});
+
+// --- Rules: each has a trigger and a silent case ---
+const weekdayAware = (fn) => (date, i) => fn(date, i, c.isWeekend(date));
+
+test('protein rule fires when under target and stays silent otherwise', () => {
+  const settings = { proteinTargetG: 150 };
+  const low = fixture(END, 7, () => ({ consumed: 2000, burned: 2500, protein: 100 }));
+  const hit = rule('protein-low', { ...low, settings });
+  eq(hit.evidence[1], 'Average shortfall 50 g');
+  const good = fixture(END, 7, () => ({ consumed: 2000, burned: 2500, protein: 160 }));
+  eq(rule('protein-low', { ...good, settings }), undefined);
+  const few = fixture(END, 3, () => ({ consumed: 2000, burned: 2500, protein: 100 }));
+  eq(rule('protein-low', { ...few, settings }), undefined, 'below threshold');
+  const unlogged = fixture(END, 7, () => ({ consumed: 2000, burned: 2500, protein: null }));
+  eq(rule('protein-low', { ...unlogged, settings }), undefined, 'protein not logged');
+});
+test('weekend rule reports share of the weekday deficit', () => {
+  // 28 days: 20 weekdays at -500 = -10000; 8 weekend days at +500 = +4000 -> 40%
+  const data = fixture(END, 28, weekdayAware((_, __, we) => ({ consumed: we ? 3000 : 2000, burned: 2500 })));
+  const hit = rule('weekend-surplus', data);
+  if (!hit.title.includes('40%')) throw new Error(hit.title);
+  const flat = fixture(END, 28, () => ({ consumed: 2000, burned: 2500 }));
+  eq(rule('weekend-surplus', flat), undefined);
+  const small = fixture(END, 28, weekdayAware((_, __, we) => ({ consumed: we ? 2600 : 2000, burned: 2500 })));
+  eq(rule('weekend-surplus', small), undefined, '8% is below threshold');
+});
+test('meal share fires at 45% and needs 5 days', () => {
+  const entriesFor = (date) => [entry(date, 1500, 30, 'dinner'), entry(date, 500, 30, 'lunch')];
+  const make = (n) => {
+    const end = END, start = c.addDays(end, -(n - 1));
+    const records = c.dateRange(start, end).map((date) => ({ date, burnedKcal: 2500 }));
+    const entries = c.dateRange(start, end).flatMap(entriesFor);
+    return { days: c.buildDays(start, end, records, entries), entries };
+  };
+  if (!rule('meal-share', make(7)).title.includes('Dinner is 75%')) throw new Error('title');
+  eq(rule('meal-share', make(4)), undefined);
+});
+test('food review flags a low-protein repeat item', () => {
+  const data = fixture(END, 14, (_, i) => ({ consumed: 1000, burned: 2500, protein: 2, name: 'Cookies' }));
+  if (!rule('food-review', data).title.includes('Cookies')) throw new Error('title');
+  const short = fixture(END, 5, () => ({ consumed: 1000, burned: 2500, protein: 2, name: 'Cookies' }));
+  eq(rule('food-review', short), undefined);
+  // 700 kcal with 34 g is about 19% of calories from protein: not a low-protein food.
+  const decent = fixture(END, 14, (_, i) => ({ consumed: 700, burned: 2500, protein: 34, name: i % 2 ? 'Pasta' : 'Stew' }));
+  if (rule('food-review', decent)?.title.includes('second look')) throw new Error('flagged a decent food');
+});
+test('target rule compares average balance with the target', () => {
+  const settings = { targetBalanceKcal: -500 };
+  const behind = fixture(END, 14, () => ({ consumed: 2300, burned: 2500 }));
+  if (!rule('target-behind', { ...behind, settings }).title.includes('300 kcal')) throw new Error('gap');
+  const onTrack = fixture(END, 14, () => ({ consumed: 2000, burned: 2500 }));
+  eq(rule('target-behind', { ...onTrack, settings }), undefined);
+  const gainGoal = fixture(END, 14, () => ({ consumed: 2500, burned: 2500 }));
+  eq(rule('target-behind', { ...gainGoal, settings: { targetBalanceKcal: 300 } }).id, 'target-behind');
+});
+test('goal rule gives a date, and warns when moving away', () => {
+  // -770/day = -0.1 kg/day, 80 -> 79 = 10 days from 2026-11-02
+  const data = fixture(END, 14, (_, i) => ({ consumed: 1730, burned: 2500, weightKg: i === 13 ? 80 : null }));
+  const hit = rule('goal-pace', { ...data, settings: { goalWeightKg: 79 } });
+  if (!hit.title.includes('12 Nov 2026')) throw new Error(hit.title);
+  eq(hit.level, 'good');
+  const away = rule('goal-pace', { ...data, settings: { goalWeightKg: 85 } });
+  eq(away.level, 'warn');
+});
+test('calibration rule fires on a large gap only', () => {
+  const flat = fixture(END, 28, () => ({ consumed: 2000, burned: 2500, weightKg: 80 }));
+  eq(rule('calibration', flat).title, 'Your real balance looks higher than logged');
+  const match = fixture(END, 28, (_, i) => ({ consumed: 2000, burned: 2500, weightKg: 80 - (i * 500) / 7700 }));
+  eq(rule('calibration', match), undefined);
+});
+test('logging gaps fire below 70% and not without data', () => {
+  const gappy = fixture(END, 14, (_, i) => (i % 2 ? { consumed: 2000, burned: 2500 } : {}));
+  eq(rule('logging-gaps', gappy).evidence[0], '7 of the last 14 days are complete');
+  const full = fixture(END, 14, () => ({ consumed: 2000, burned: 2500 }));
+  eq(rule('logging-gaps', full), undefined);
+  const empty = fixture(END, 14, () => ({}));
+  eq(rule('logging-gaps', empty), undefined);
+});
+test('safety rules fire and rank first', () => {
+  // -1100/day = 1 kg/week = 1.25% of 80 kg; 1000 kcal intake is also below the floor
+  const data = fixture(END, 14, (_, i) => ({ consumed: 1000, burned: 2100, weightKg: 80 }));
+  const list = buildSuggestions({ ...data, settings: {}, today: c.addDays(END, 1) });
+  eq(list[0].level, 'safety'); eq(list[1].level, 'safety');
+  const gentle = fixture(END, 14, () => ({ consumed: 2000, burned: 2500, weightKg: 80 }));
+  eq(rule('safety-pace', gentle), undefined);
+  eq(rule('safety-intake', gentle), undefined);
+});
+test('today is ignored until it counts', () => {
+  const { days, entries } = fixture(END, 7, (_, i) => (i === 6 ? { consumed: 3000 } : { consumed: 2000, burned: 2500, protein: 100 }));
+  const list = buildSuggestions({ days, entries, settings: { proteinTargetG: 150 }, today: END });
+  eq(list.find((s) => s.id === 'protein-low').evidence[0], 'Under 150 g on 6 of the last 6 days with protein logged');
+});
+test('no data gives no suggestions', () => {
+  eq(buildSuggestions({ days: [], entries: [], settings: {}, today: END }), []);
+});
+
+// --- Open Food Facts ---
+test('parses a complete product', () => {
+  const p = parseProduct({ status: 1, product: { product_name: 'Nutella', brands: 'Ferrero, X', serving_quantity: 15, nutriments: { 'energy-kcal_100g': 539, proteins_100g: 6.3 } } }, '301');
+  eq(p, { status: 'found', barcode: '301', name: 'Nutella - Ferrero', kcalPer100g: 539, proteinPer100g: 6.3, servingG: 15 });
+});
+test('falls back from kJ to kcal', () => {
+  eq(parseProduct({ status: 1, product: { product_name: 'A', nutriments: { energy_100g: 418.4, proteins_100g: 1 } } }, '1').kcalPer100g, 100);
+});
+test('incomplete and unknown products', () => {
+  eq(parseProduct({ status: 1, product: { product_name: 'A', nutriments: { 'energy-kcal_100g': 100 } } }, '1').status, 'incomplete');
+  eq(parseProduct({ status: 1, product: { nutriments: { 'energy-kcal_100g': 100, proteins_100g: 2 } } }, '1').status, 'incomplete');
+  eq(parseProduct({ status: 0 }, '1'), { status: 'notfound', barcode: '1' });
+});
+
+// --- Backups ---
+test('backup validation rejects bad files', () => {
+  const good = { app: 'diet-tracker-backup', version: 1, days: [{ date: '2026-11-01' }], entries: [entry('2026-11-01', 100)], foods: [], mealTemplates: [] };
+  eq(validateBackup(good), null);
+  if (!validateBackup({})) throw new Error('empty object');
+  if (!validateBackup({ ...good, version: 2 })) throw new Error('version');
+  if (!validateBackup({ ...good, entries: [{ id: 'x', date: '2026-11-01', meal: 'lunch', name: 'A', kcal: 'lots' }] })) throw new Error('kcal');
+  if (!validateBackup({ ...good, days: undefined })) throw new Error('days');
+});
+
+const failed = results.filter((r) => !r.ok);
+document.getElementById('summary').textContent = failed.length ? `${failed.length} of ${results.length} FAILED` : `All ${results.length} passed`;
+document.getElementById('summary').className = failed.length ? 'fail' : 'pass';
+const list = document.getElementById('results');
+for (const r of [...failed, ...results.filter((x) => x.ok)]) {
+  const div = document.createElement('div');
+  div.className = r.ok ? 'pass' : 'fail';
+  div.textContent = `${r.ok ? 'PASS' : 'FAIL'}  ${r.name}${r.message ? ` — ${r.message}` : ''}`;
+  list.append(div);
+}
+</script>
+</body>
+</html>
